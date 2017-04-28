@@ -16,21 +16,22 @@
 
 package com.mongodb.spark
 
+import java.util
+import java.util.List
+
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe._
-
 import org.apache.spark.SparkContext
 import org.apache.spark.api.java.{JavaRDD, JavaSparkContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
 import org.apache.spark.sql.sources.{Filter, IsNotNull}
 import org.apache.spark.sql.types.StructType
-
 import org.bson.conversions.Bson
-import org.bson.{BsonDocument, Document}
+import org.bson.{BsonDocument, BsonElement, Document}
 import com.mongodb.client.MongoCollection
-import com.mongodb.client.model.{InsertOneModel, ReplaceOneModel, UpdateOptions}
+import com.mongodb.client.model.{InsertOneModel, ReplaceOneModel, UpdateOneModel, UpdateOptions}
 import com.mongodb.spark.DefaultHelper.DefaultsTo
 import com.mongodb.spark.config.{ReadConfig, WriteConfig}
 import com.mongodb.spark.rdd.MongoRDD
@@ -167,7 +168,8 @@ object MongoSpark {
             val updateOptions = new UpdateOptions().upsert(true)
             val requests = batch.map(doc =>
               Option(doc.get("_id")) match {
-                case Some(_id) => new ReplaceOneModel[BsonDocument](new BsonDocument("_id", _id), doc, updateOptions)
+                //case Some(_id) => new ReplaceOneModel[BsonDocument](new BsonDocument("_id", _id), doc, updateOptions)
+                case Some(_id) => new UpdateOneModel[BsonDocument](new BsonDocument("_id", _id), new BsonDocument("$set", doc), updateOptions)
                 case None      => new InsertOneModel[BsonDocument](doc)
               })
             collection.bulkWrite(requests.toList.asJava)
@@ -176,6 +178,63 @@ object MongoSpark {
       })
     } else {
       MongoSpark.save(documentRdd, writeConfig)
+    }
+  }
+
+  /**
+   * Save data to MongoDB
+   * 2017-04-25  ygg pafvell@163.com add
+   * '''Note:''' If the dataFrame contains an `_id` field the data will upserted and replace any existing documents in the collection.
+   *
+   * @param dataset the dataset to save to MongoDB
+   * @param writeConfig the writeConfig
+   * @param keys update by keys  (should be primary keys)
+   * @tparam D
+   * @since 1.1.0
+   */
+  def save[D](dataset: Dataset[D], writeConfig: WriteConfig, keys: Seq[String]): Unit = {
+    val mongoConnector = MongoConnector(writeConfig.asOptions)
+    val documentRdd: RDD[BsonDocument] = dataset.toDF().rdd.map(row => rowToDocument(row))
+    //val fieldsSeq: Array[String] = new Array[String](3)
+    //dataset.schema.fields.foreach(s => fieldsSeq + s.name)
+    val fieldsSeq: Seq[String] = dataset.schema.fields.map(s => s.name + "")
+    if (fieldsSeq.toList.asJava.containsAll(keys.toList.asJava)) {
+      documentRdd.foreachPartition(iter => if (iter.nonEmpty) {
+        mongoConnector.withCollectionDo(writeConfig, { collection: MongoCollection[BsonDocument] =>
+          iter.grouped(DefaultMaxBatchSize).foreach(batch => {
+            val updateOptions = new UpdateOptions().upsert(true)
+            val requests = batch.map(doc => {
+              /*
+              var ext = true
+              keys.foreach(key => {
+                Option(doc.get(key)) match {
+                  case Some(_) => None
+                  case None    => ext = false
+                }
+              })
+              val bsonElementLst: Seq[BsonElement] = keys.map(str => new BsonElement(str, doc.get(str)))
+              if (ext) {
+                new ReplaceOneModel[BsonDocument](new BsonDocument(bsonElementLst.toList.asJava), doc, updateOptions)
+              } else {
+                new InsertOneModel[BsonDocument](doc)
+              }
+              */
+              val bsonElementLst: Seq[BsonElement] = keys.map(str => new BsonElement(str, doc.get(str)))
+              new ReplaceOneModel[BsonDocument](new BsonDocument(bsonElementLst.toList.asJava), doc, updateOptions)
+            })
+            collection.bulkWrite(requests.toList.asJava)
+            /*val updateOptions = new UpdateOptions().upsert(true)
+            batch.map(doc => {
+              val bsonElementLst: Seq[BsonElement] = keys.map(str => new BsonElement(str, doc.get(str)))
+              //updateOne   error: invalid bson field name merchant_code
+              //replaceOne  very slow;1s ≈ 100
+              collection.replaceOne(new BsonDocument(bsonElementLst.toList.asJava), doc, updateOptions)
+            })*/
+          })
+        })
+      })
+    } else {
+      throw new IllegalArgumentException("dataset fields don't contain keys")
     }
   }
 
